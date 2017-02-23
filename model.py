@@ -210,8 +210,8 @@ def evaluate_model():
 
         # Evaluation of model
         score = model.evaluate(X_test, y_test, verbose=0)
-        print("Accuracy: %.2f%%" % (scores[1]*100))
-        sum_scores += scores[1]
+        print("Accuracy: %.2f%%" % (score[1]*100))
+        sum_scores += score[1]
     print "========================="
     accuracy = sum_scores/len(kf_splits.train)
     print "Cross validation accuracy: ", accuracy
