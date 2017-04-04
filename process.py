@@ -3,12 +3,14 @@ import numpy as np
 import pandas as pd
 import pdb
 import pickle
+import scipy
 
 
 # Constants
 CORPUS_PATH = 'PaHaW/PaHaW_files/corpus_PaHaW.xlsx'
 SVC_DIR = 'PaHaW/PaHaW_public'
-
+IMG_DIM = (6000, 10000)
+TINY_DIM = (300, 500)
 
 class Subject(object):
     """Stores the subject level data
@@ -62,7 +64,18 @@ class PaHaWDataset(object):
                 np.max(task[in_air, 8]) - np.min(task[in_air, 8]),
                 # 75th percentile of on-surface horizontal velocity
                 np.percentile(task[np.logical_not(in_air), 8], 0.75),
-                np.min(task[in_air, 10]) # Min. in air vertical accel.
+                np.min(task[in_air, 10]), # Min. in air vertical accel.
+                # 99-1 percentile vertical velocity
+                np.percentile(task[in_air, 8], 0.99) - np.percentile(task[in_air, 8], 0.01),
+                # Mean velocity
+                np.mean(task[in_air, 13]),
+                # Mean altitutde velocity
+                np.mean(task[in_air, 17]),
+                # 99-1 percentile altitude velocity
+                np.percentile(task[in_air, 17], 0.99) - np.percentile(task[in_air, 17], 0.01),
+                # Std dev. altitude velocity
+                np.std(task[in_air, 17])
+
             ])
             return summary_vect
         except:
@@ -70,6 +83,34 @@ class PaHaWDataset(object):
             # because pen was never lifted from paper - e.g. in task 1. We will
             # just skip the task if this happens.
             pass
+
+    def extract_imgs(self, task):
+        # Initialize image arrays
+        img_paper = np.zeros(IMG_DIM)
+        img_air = np.zeros(IMG_DIM)
+        # Extract coordinates
+        x = task[:, 1]
+        y = task[:, 0]
+        idx = task[:, 3]
+        # Upsample handwriting samples
+        t = np.arange(task.shape[0])
+        dt = np.linspace(0, task.shape[0], 100*task.shape[0])
+        x = np.interp(dt, t, x).astype(np.int16)
+        y = np.interp(dt, t, y).astype(np.int16)
+        idx = np.interp(dt, t, idx).astype(np.int16)
+        # Seperate on-paper and in-air samples
+        on_paper = idx == 1
+        in_air = idx == 0
+        # Create thickened images
+        n = 5
+        for dx in xrange(-n, n+1):
+            for dy in xrange(-n, n+1):
+                img_paper[y[on_paper] + dy, x[on_paper] + dx] += 1
+                img_air[y[in_air] + dy, x[in_air] + dx] += 1
+        # Downsample images
+        img_paper = img_paper[::20, ::20]
+        img_air = img_air[::20, ::20]
+        return img_paper, img_air
 
     def update(self):
         from keras.preprocessing import sequence
@@ -91,14 +132,28 @@ class PaHaWDataset(object):
                 tasks = [self.summarize(task) for task in
                          subject.task.itervalues()]
                 tasks = [task for task in tasks if task is not None]
+            if self.method is 'img':
+                img_paper = np.zeros(TINY_DIM)
+                img_air = np.zeros(TINY_DIM)
+                for task in subject.task.itervalues():
+                    dp, da = self.extract_imgs(task)
+                    img_paper += dp
+                    img_air += da
+                tasks = [(img_paper, img_air)]
             x += tasks
             y += [subject.info['PD status']] * len(tasks)
 
         # Convert to arrays
-        if self.method != 'summary':
-            x = sequence.pad_sequences(x, maxlen=self.maxlen, dtype='float32')
-        else:
+        if self.method == 'summary':
             x = np.vstack(x)
+        elif self.method == 'img':
+            pdb.set_trace()
+            on_paper = np.stack([task[0].reshape(1, TINY_DIM[0], TINY_DIM[1])  for task in x])
+            in_air = np.stack([task[1].reshape(1, TINY_DIM[0], TINY_DIM[1]) for task in x])
+            x = on_paper, in_air
+        else:
+            x = sequence.pad_sequences(x, maxlen=400, dtype='float32')
+
         y = np.array(y, dtype='float32')
 
         # Normalize x-values
@@ -114,7 +169,7 @@ class PaHaWDataset(object):
 
     @method.setter
     def method(self, method):
-        if method in ['subsample', 'window', 'summary', None]:
+        if method in ['subsample', 'window', 'summary', 'img', None]:
             self._method = method
             self.update()
         else:
@@ -197,7 +252,7 @@ def generate_svc_path(subject_id, task_index):
     return "%s/%s/%s__%i_1.svc" % (SVC_DIR, subject_id, subject_id, task_index)
 
 
-def parse_svc(path):
+def parse_svc(path, i):
     """Processes the data in an .svc file to a numpy array
 
     For more information on the .svc format refer to the 'info.txt' file
@@ -227,7 +282,11 @@ def parse_svc(path):
             16: azimuth-velocity,
             17: altitude-velocity,
             18: pressure-velocity,
+            19-26: One hot encoding of task
+
     """
+    from sklearn.preprocessing import OneHotEncoder
+
     # Open the file
     with open(path, 'r') as svc_file:
         samples = svc_file.readlines()
@@ -259,7 +318,11 @@ def parse_svc(path):
     aap_vel = displace(array[:,4:])
 
     # add task id as feature
-    # new_col = i * np.ones((array.shape[0],1))
+    # print array.shape
+    new_col = (i-1) * np.ones((n,1))
+    enc = OneHotEncoder(n_values=8)
+    # one_hot = np.asarray(enc.fit_transform(new_col).todense())
+
     out = np.concatenate((array, xy_vel, xy_accel, xy_jerk, m_vel, m_accel,
                           m_jerk, aap_vel), axis=1)
     return out
@@ -292,7 +355,7 @@ def extract_datasets(test_fraction = 0.333):
 
     # Build a Subject object for each row in the corpus and randomly assign to
     # train or test dataset
-    for row in corpus.iterrows():
+    for i, row in enumerate(corpus.iterrows()):
         subject = Subject()
         subject.info = row[1]
         subject.task = dict()
@@ -302,7 +365,7 @@ def extract_datasets(test_fraction = 0.333):
         for i in xrange(1, 9):
             try:
                 svc_path = generate_svc_path(subject_id, i)
-                task_data = parse_svc(svc_path)
+                task_data = parse_svc(svc_path, i)
                 subject.task[i] = task_data
             except IOError:
                 print 'Subject %s did not perform task %i' % (subject_id, i)
@@ -321,7 +384,10 @@ def extract_datasets(test_fraction = 0.333):
 
 
 if __name__ == '__main__':
+    print "Extracting data"
     data = extract_datasets()
-    with open('PaHaW/processed_data.pkl', 'wb') as pkl_file:
+    print "Saving data"
+    with open('PaHaW/processed_img_data.pkl', 'wb') as pkl_file:
         pickle.dump(data, pkl_file)
+    print "Done!"
 
